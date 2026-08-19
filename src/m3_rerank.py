@@ -6,7 +6,7 @@ import os, sys, time
 from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import RERANK_TOP_K
+from config import RERANK_TOP_K, RERANKER_MODEL, RERANKER_DEVICE
 
 
 @dataclass
@@ -19,34 +19,38 @@ class RerankResult:
 
 
 class CrossEncoderReranker:
-    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3"):
+    def __init__(self, model_name: str = RERANKER_MODEL, device: str = RERANKER_DEVICE):
         self.model_name = model_name
+        self.device = device
         self._model = None
 
     def _load_model(self):
+        """Lazy load — chỉ tải model khi thực sự rerank.
+
+        device mặc định "cpu": GPU 3.68 GiB đã dành cho bge-m3 của DenseSearch,
+        nạp thêm reranker 2.2 GB lên GPU sẽ CUDA OOM.
+        """
         if self._model is None:
-            # TODO: Load cross-encoder model
-            # from sentence_transformers import CrossEncoder
-            # self._model = CrossEncoder(self.model_name)
-            #
-            # ⚠️ LƯU Ý: Dùng sentence_transformers.CrossEncoder, KHÔNG dùng FlagEmbedding.
-            # FlagReranker crash với transformers>=5.0 (XLMRobertaTokenizer lỗi).
-            pass
+            from sentence_transformers import CrossEncoder
+            kwargs = {"device": self.device} if self.device else {}
+            self._model = CrossEncoder(self.model_name, **kwargs)
         return self._model
 
     def rerank(self, query: str, documents: list[dict], top_k: int = RERANK_TOP_K) -> list[RerankResult]:
         """Rerank documents: top-20 → top-k."""
-        # TODO: Implement reranking
-        # 1. if not documents: return []
-        # 2. model = self._load_model()
-        # 3. pairs = [(query, doc["text"]) for doc in documents]
-        # 4. scores = model.predict(pairs)
-        # 5. if isinstance(scores, (int, float)): scores = [scores]
-        # 6. scored = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
-        # 7. Return [RerankResult(text=..., original_score=doc.get("score", 0.0),
-        #            rerank_score=float(score), metadata=..., rank=i)
-        #            for i, (score, doc) in enumerate(scored[:top_k])]
-        return []
+        if not documents:
+            return []
+        model = self._load_model()
+        pairs = [(query, doc["text"]) for doc in documents]
+        scores = model.predict(pairs)
+        if isinstance(scores, (int, float)):
+            scores = [scores]
+        scored = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
+        return [
+            RerankResult(text=doc["text"], original_score=float(doc.get("score", 0.0)),
+                         rerank_score=float(score), metadata=doc.get("metadata", {}), rank=i)
+            for i, (score, doc) in enumerate(scored[:top_k])
+        ]
 
 
 class FlashrankReranker:

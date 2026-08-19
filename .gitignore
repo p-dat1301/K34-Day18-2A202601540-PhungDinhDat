@@ -6,3 +6,7 @@ __pycache__/
 qdrant_data/
 *.egg-info/
 reports/*.json
+.omo/
+.venv/
+venv/
+.codegraph

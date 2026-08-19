@@ -57,29 +57,43 @@ def build_pipeline():
     return search, reranker
 
 
-def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) -> tuple[str, list[str]]:
-    """Run single query through pipeline."""
+def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker,
+              timings: dict | None = None) -> tuple[str, list[str]]:
+    """Run single query through pipeline.
+
+    timings: nếu truyền vào, ghi latency (ms) từng bước để làm latency breakdown.
+    """
+    t0 = time.perf_counter()
     results = search.search(query)
+    t_search = (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
     docs = [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in results]
     reranked = reranker.rerank(query, docs, top_k=RERANK_TOP_K)
+    t_rerank = (time.perf_counter() - t0) * 1000
     contexts = [r.text for r in reranked] if reranked else [r.text for r in results[:3]]
 
-    from config import OPENAI_API_KEY
-    if OPENAI_API_KEY and contexts:
+    from src.llm import chat
+    t0 = time.perf_counter()
+    if contexts:
         try:
-            from openai import OpenAI
-            client = OpenAI()
             context_str = "\n\n".join(contexts)
-            resp = client.chat.completions.create(model="gpt-4o-mini", messages=[
-                {"role": "system", "content": "Trả lời CHỈ dựa trên context. Nếu không có → nói 'Không tìm thấy.'"},
-                {"role": "user", "content": f"Context:\n{context_str}\n\nCâu hỏi: {query}"},
-            ])
-            answer = resp.choices[0].message.content
+            answer = chat("Trả lời CHỈ dựa trên context. Nếu không có → nói 'Không tìm thấy.'",
+                          f"Context:\n{context_str}\n\nCâu hỏi: {query}")
+            if not answer:
+                answer = contexts[0]
         except Exception as e:
             print(f"  ⚠️  LLM generation failed: {e}", flush=True)
             answer = contexts[0]
     else:
-        answer = contexts[0] if contexts else "Không tìm thấy thông tin."
+        answer = "Không tìm thấy thông tin."
+    t_llm = (time.perf_counter() - t0) * 1000
+
+    if timings is not None:
+        timings.setdefault("search_ms", []).append(t_search)
+        timings.setdefault("rerank_ms", []).append(t_rerank)
+        timings.setdefault("llm_ms", []).append(t_llm)
+        timings.setdefault("total_ms", []).append(t_search + t_rerank + t_llm)
     return answer, contexts
 
 
@@ -88,9 +102,10 @@ def evaluate_pipeline(search: HybridSearch, reranker: CrossEncoderReranker):
     test_set = load_test_set()
     print(f"\n[Eval] Running {len(test_set)} queries...", flush=True)
     questions, answers, all_contexts, ground_truths = [], [], [], []
+    timings: dict[str, list[float]] = {}
 
     for i, item in enumerate(test_set):
-        answer, contexts = run_query(item["question"], search, reranker)
+        answer, contexts = run_query(item["question"], search, reranker, timings)
         questions.append(item["question"])
         answers.append(answer)
         all_contexts.append(contexts)
@@ -109,9 +124,43 @@ def evaluate_pipeline(search: HybridSearch, reranker: CrossEncoderReranker):
         s = results.get(m, 0)
         print(f"  {'✓' if s >= 0.75 else '✗'} {m}: {s:.4f}")
 
+    latency = _summarize_latency(timings)
+    _print_latency(latency)
+
     failures = failure_analysis(results.get("per_question", []))
-    save_report(results, failures)
+    save_report(results, failures, latency=latency)
     return results
+
+
+def _summarize_latency(timings: dict[str, list[float]]) -> dict:
+    """Trung bình / p50 / p95 (ms) cho từng bước của pipeline."""
+    summary = {}
+    for stage, values in timings.items():
+        if not values:
+            continue
+        ordered = sorted(values)
+        summary[stage] = {
+            "avg": round(sum(ordered) / len(ordered), 1),
+            "p50": round(ordered[len(ordered) // 2], 1),
+            "p95": round(ordered[min(int(len(ordered) * 0.95), len(ordered) - 1)], 1),
+            "n": len(ordered),
+        }
+    return summary
+
+
+def _print_latency(latency: dict) -> None:
+    if not latency:
+        return
+    print("\n" + "=" * 60)
+    print("LATENCY BREAKDOWN (ms/query)")
+    print("=" * 60)
+    print(f"  {'Stage':<14} {'avg':>9} {'p50':>9} {'p95':>9}")
+    labels = {"search_ms": "Hybrid search", "rerank_ms": "Rerank", "llm_ms": "LLM answer",
+              "total_ms": "TOTAL"}
+    for stage in ["search_ms", "rerank_ms", "llm_ms", "total_ms"]:
+        s = latency.get(stage)
+        if s:
+            print(f"  {labels[stage]:<14} {s['avg']:>9.1f} {s['p50']:>9.1f} {s['p95']:>9.1f}")
 
 
 if __name__ == "__main__":

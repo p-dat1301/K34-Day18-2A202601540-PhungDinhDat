@@ -8,11 +8,12 @@ Làm giàu chunks TRƯỚC khi embed: Summarize, HyQA, Contextual Prepend, Auto 
 Test: pytest tests/test_m5.py
 """
 
-import os, sys
+import os, sys, re, json, hashlib
 from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import OPENAI_API_KEY
+from config import LLM_PROVIDER, GEMINI_MODEL, ENRICHMENT_CACHE_PATH
+from src.llm import chat, chat_json
 
 
 @dataclass
@@ -34,30 +35,14 @@ def summarize_chunk(text: str) -> str:
     Tạo summary ngắn cho chunk.
     Embed summary thay vì (hoặc cùng với) raw chunk → giảm noise.
     """
-    # TODO: Implement chunk summarization
-    # if OPENAI_API_KEY:
-    #     try:
-    #         from openai import OpenAI
-    #         client = OpenAI()
-    #         resp = client.chat.completions.create(
-    #             model="gpt-4o-mini",
-    #             messages=[
-    #                 {"role": "system", "content": "Tóm tắt đoạn văn sau trong 2-3 câu ngắn gọn bằng tiếng Việt."},
-    #                 {"role": "user", "content": text},
-    #             ],
-    #             max_tokens=150,
-    #         )
-    #         return resp.choices[0].message.content.strip()
-    #     except Exception as e:
-    #         print(f"  ⚠️  OpenAI summarize failed: {e}")
-    #
-    # Extractive fallback (không cần API):
-    # sentences = [s.strip() for s in text.replace("\n", " ").split(". ") if s.strip()]
-    # return ". ".join(sentences[:2]) + "." if sentences else text
-    return text
+    if LLM_PROVIDER != "none":
+        summary = chat("Tóm tắt đoạn văn sau trong 2-3 câu ngắn gọn bằng tiếng Việt.",
+                       text, max_tokens=150)
+        if summary:
+            return summary
 
-
-# ─── Technique 2: Hypothesis Question-Answer (HyQA) ─────
+    sentences = [s.strip() for s in text.replace("\n", " ").split(". ") if s.strip()]
+    return ". ".join(sentences[:2]) + "." if sentences else text
 
 
 def generate_hypothesis_questions(text: str, n_questions: int = 3) -> list[str]:
@@ -65,32 +50,38 @@ def generate_hypothesis_questions(text: str, n_questions: int = 3) -> list[str]:
     Generate câu hỏi mà chunk có thể trả lời.
     Index cả questions lẫn chunk → query match tốt hơn (bridge vocabulary gap).
     """
-    # TODO: Implement HyQA generation
-    # if OPENAI_API_KEY:
-    #     try:
-    #         from openai import OpenAI
-    #         client = OpenAI()
-    #         resp = client.chat.completions.create(
-    #             model="gpt-4o-mini",
-    #             messages=[
-    #                 {"role": "system", "content": f"Dựa trên đoạn văn, tạo {n_questions} câu hỏi mà đoạn văn có thể trả lời. Trả về mỗi câu hỏi trên 1 dòng."},
-    #                 {"role": "user", "content": text},
-    #             ],
-    #             max_tokens=200,
-    #         )
-    #         questions = resp.choices[0].message.content.strip().split("\n")
-    #         return [q.strip().lstrip("0123456789.-) ") for q in questions if q.strip()][:n_questions]
-    #     except Exception as e:
-    #         print(f"  ⚠️  OpenAI HyQA failed: {e}")
-    #
-    # Extractive fallback:
-    # import re
-    # sentences = [s.strip() for s in re.split(r'[.!?\n]', text) if len(s.strip()) > 10]
-    # return [f"{s.rstrip('.')}?" for s in sentences[:n_questions]]
-    return []
+    if LLM_PROVIDER != "none":
+        raw = chat(f"Dựa trên đoạn văn, tạo {n_questions} câu hỏi mà đoạn văn có thể trả lời. "
+                   "Mỗi câu hỏi trên 1 dòng, kết thúc bằng dấu '?'. "
+                   "Không đánh số, không thêm lời dẫn.", text, max_tokens=200)
+        questions = _clean_questions(raw, n_questions)
+        if questions:
+            return questions
+
+    sentences = [s.strip() for s in re.split(r"[.!?\n]", text) if len(s.strip()) > 10]
+    return [f"{s.rstrip('.')}?" for s in sentences[:n_questions]]
 
 
-# ─── Technique 3: Contextual Prepend (Anthropic style) ──
+def _clean_questions(raw: str, n_questions: int) -> list[str]:
+    """Chuẩn hoá output LLM thành list câu hỏi sạch.
+
+    LLM hay trả kèm lời dẫn ("Dưới đây là 3 câu hỏi:"), bullet/markdown, hoặc
+    quên dấu '?' — chuẩn hoá ở đây để downstream (embed HyQA) luôn nhận câu hỏi.
+    """
+    if not raw:
+        return []
+    questions = []
+    for line in raw.strip().split("\n"):
+        q = line.strip().lstrip("*-•").strip()
+        q = re.sub(r"^\d+[.)]\s*", "", q)          # bỏ "1." / "2)"
+        q = re.sub(r"^\*\*(.+?)\*\*:?\s*", r"\1", q)  # bỏ **bold**
+        q = q.strip().strip("*").strip()
+        if len(q) < 5 or q.endswith(":"):           # bỏ lời dẫn kiểu "Câu hỏi:"
+            continue
+        if not q.endswith("?"):
+            q = q.rstrip(".") + "?"
+        questions.append(q)
+    return questions[:n_questions]
 
 
 def contextual_prepend(text: str, document_title: str = "") -> str:
@@ -98,90 +89,91 @@ def contextual_prepend(text: str, document_title: str = "") -> str:
     Prepend context giải thích chunk nằm ở đâu trong document.
     Anthropic benchmark: giảm 49% retrieval failure (alone).
     """
-    # TODO: Implement contextual prepend
-    # if OPENAI_API_KEY:
-    #     try:
-    #         from openai import OpenAI
-    #         client = OpenAI()
-    #         resp = client.chat.completions.create(
-    #             model="gpt-4o-mini",
-    #             messages=[
-    #                 {"role": "system", "content": "Viết 1 câu ngắn mô tả đoạn văn này nằm ở đâu trong tài liệu và nói về chủ đề gì. Chỉ trả về 1 câu."},
-    #                 {"role": "user", "content": f"Tài liệu: {document_title}\n\nĐoạn văn:\n{text}"},
-    #             ],
-    #             max_tokens=80,
-    #         )
-    #         context = resp.choices[0].message.content.strip()
-    #         return f"{context}\n\n{text}"
-    #     except Exception as e:
-    #         print(f"  ⚠️  OpenAI contextual failed: {e}")
-    #
-    # Simple fallback:
-    # prefix = f"Trích từ {document_title}. " if document_title else ""
-    # return f"{prefix}{text}"
-    return text
+    if LLM_PROVIDER != "none":
+        context = chat("Viết 1 câu ngắn mô tả đoạn văn này nằm ở đâu trong tài liệu và "
+                       "nói về chủ đề gì. Chỉ trả về 1 câu.",
+                       f"Tài liệu: {document_title}\n\nĐoạn văn:\n{text}", max_tokens=80)
+        if context:
+            return f"{context}\n\n{text}"
 
-
-# ─── Technique 4: Auto Metadata Extraction ──────────────
+    prefix = f"Trích từ {document_title}. " if document_title else ""
+    return f"{prefix}{text}"
 
 
 def extract_metadata(text: str) -> dict:
     """
     LLM extract metadata tự động: topic, entities, date_range, category.
     """
-    # TODO: Implement auto metadata extraction
-    # if OPENAI_API_KEY:
-    #     try:
-    #         import json as _json
-    #         from openai import OpenAI
-    #         client = OpenAI()
-    #         resp = client.chat.completions.create(
-    #             model="gpt-4o-mini",
-    #             messages=[
-    #                 {"role": "system", "content": 'Trích xuất metadata từ đoạn văn. Trả về JSON: {"topic": "...", "entities": ["..."], "category": "policy|hr|it|finance", "language": "vi|en"}'},
-    #                 {"role": "user", "content": text},
-    #             ],
-    #             max_tokens=150,
-    #         )
-    #         return _json.loads(resp.choices[0].message.content)
-    #     except Exception as e:
-    #         print(f"  ⚠️  OpenAI metadata failed: {e}")
-    #
-    # return {"topic": "general", "entities": [], "category": "policy", "language": "vi"}
-    return {}
+    if LLM_PROVIDER != "none":
+        meta = chat_json(
+            'Trích xuất metadata từ đoạn văn. Trả về JSON: '
+            '{"topic": "...", "entities": ["..."], "category": "policy|hr|it|finance", "language": "vi|en"}',
+            text, max_tokens=150)
+        if meta:
+            return meta
+
+    return {"topic": "general", "entities": [], "category": "policy", "language": "vi"}
 
 
 # ─── Combined Single-Call Mode ───────────────────────────
 
 
+_CACHE: dict | None = None
+
+
+def _load_cache() -> dict:
+    """Cache enrichment theo nội dung chunk — chạy lại pipeline không tốn quota API."""
+    global _CACHE
+    if _CACHE is None:
+        try:
+            with open(ENRICHMENT_CACHE_PATH, encoding="utf-8") as f:
+                _CACHE = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            _CACHE = {}
+    return _CACHE
+
+
+def _save_cache() -> None:
+    if _CACHE is None:
+        return
+    os.makedirs(os.path.dirname(ENRICHMENT_CACHE_PATH), exist_ok=True)
+    with open(ENRICHMENT_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(_CACHE, f, ensure_ascii=False)
+
+
+def _cache_key(text: str, source: str) -> str:
+    return hashlib.sha1(f"{GEMINI_MODEL}|{source}|{text}".encode("utf-8")).hexdigest()
+
+
 def _enrich_single_call(text: str, source: str) -> dict:
     """Single LLM call to get summary + questions + context + metadata.
 
-    ⚠️ Cost optimization: 1 API call thay vì 4 calls riêng lẻ.
+    Cost optimization: 1 API call thay vì 4 calls riêng lẻ, cộng cache trên đĩa
+    để lần chạy sau không gọi lại API cho cùng một chunk.
     """
-    # TODO: Implement combined enrichment (1 call/chunk)
-    # if OPENAI_API_KEY:
-    #     try:
-    #         import json as _json
-    #         from openai import OpenAI
-    #         client = OpenAI()
-    #         resp = client.chat.completions.create(
-    #             model="gpt-4o-mini",
-    #             messages=[
-    #                 {"role": "system", "content": """Phân tích đoạn văn và trả về JSON:
-    # {
-    #   "summary": "tóm tắt 2-3 câu",
-    #   "questions": ["câu hỏi 1", "câu hỏi 2", "câu hỏi 3"],
-    #   "context": "1 câu mô tả đoạn văn nằm ở đâu trong tài liệu",
-    #   "metadata": {"topic": "...", "entities": ["..."], "category": "policy|hr|it|finance", "language": "vi|en"}
-    # }"""},
-    #                 {"role": "user", "content": f"Tài liệu: {source}\n\nĐoạn văn:\n{text}"},
-    #             ],
-    #             max_tokens=400,
-    #         )
-    #         return _json.loads(resp.choices[0].message.content)
-    #     except Exception as e:
-    #         print(f"  ⚠️  Enrichment API failed: {e}")
+    if LLM_PROVIDER == "none":
+        return {}
+
+    cache = _load_cache()
+    key = _cache_key(text, source)
+    if key in cache:
+        return cache[key]
+
+    result = _call_enrich_llm(text, source)
+    if result:
+        cache[key] = result
+        _save_cache()
+    return result
+
+
+def _call_enrich_llm(text: str, source: str) -> dict:
+    if LLM_PROVIDER != "none":
+        return chat_json(
+            'Phân tích đoạn văn và trả về JSON: '
+            '{"summary": "tóm tắt 2-3 câu", "questions": ["câu hỏi 1", "câu hỏi 2", "câu hỏi 3"], '
+            '"context": "1 câu mô tả đoạn văn nằm ở đâu trong tài liệu", '
+            '"metadata": {"topic": "...", "entities": ["..."], "category": "policy|hr|it|finance", "language": "vi|en"}}',
+            f"Tài liệu: {source}\n\nĐoạn văn:\n{text}", max_tokens=400)
     return {}
 
 

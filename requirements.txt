@@ -7,6 +7,7 @@ sentence-transformers>=3.0
 flashrank>=0.2
 ragas>=0.1.10,<0.2
 langchain-community>=0.2,<0.3
+langchain-google-genai<2
 langchain-openai>=0.1,<0.2
 datasets>=2.19
 openai>=1.30
