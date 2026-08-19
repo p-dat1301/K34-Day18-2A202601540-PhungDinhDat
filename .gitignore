@@ -10,3 +10,4 @@ reports/*.json
 .venv/
 venv/
 .codegraph
+.cache/

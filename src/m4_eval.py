@@ -15,10 +15,11 @@ class EvalResult:
     answer: str
     contexts: list[str]
     ground_truth: str
-    faithfulness: float
-    answer_relevancy: float
-    context_precision: float
-    context_recall: float
+    # None = RAGAS không chấm được metric đó cho câu này (NaN), khác với 0.0.
+    faithfulness: float | None
+    answer_relevancy: float | None
+    context_precision: float | None
+    context_recall: float | None
 
 
 def load_test_set(path: str = TEST_SET_PATH) -> list[dict]:
@@ -47,14 +48,18 @@ def evaluate_ragas(questions: list[str], answers: list[str],
             m.embeddings = embeddings
 
         def _score(row, key):
-            """RAGAS trả nan khi 1 metric fail cho câu đó — quy về 0.0 để
-            aggregate và failure_analysis không bị nhiễm nan."""
+            """RAGAS trả NaN khi không chấm được câu đó (ví dụ faithfulness không
+            trích được statement nào từ câu trả lời cực ngắn "3 ngày làm việc").
+
+            NaN = "không đo được", KHÁC với 0.0 = "sai". Trả None để aggregate
+            bỏ qua, tránh kéo điểm xuống oan.
+            """
             import math
             try:
                 v = float(row.get(key, 0.0))
             except (TypeError, ValueError):
-                return 0.0
-            return 0.0 if math.isnan(v) else v
+                return None
+            return None if math.isnan(v) else v
 
         dataset = Dataset.from_dict({
             "question": questions, "answer": answers,
@@ -77,20 +82,33 @@ def evaluate_ragas(questions: list[str], answers: list[str],
         ) for _, row in df.iterrows()]
 
         def _agg(key):
-            vals = [getattr(r, key) for r in per_question if getattr(r, key) is not None]
+            vals = [v for v in (getattr(r, key) for r in per_question) if v is not None]
             return round(sum(vals) / len(vals), 4) if vals else 0.0
 
-        return {
-            "faithfulness": _agg("faithfulness"),
-            "answer_relevancy": _agg("answer_relevancy"),
-            "context_precision": _agg("context_precision"),
-            "context_recall": _agg("context_recall"),
-            "per_question": per_question,
-        }
+        def _measured(key):
+            return sum(1 for r in per_question if getattr(r, key) is not None)
+
+        metric_names = ["faithfulness", "answer_relevancy",
+                        "context_precision", "context_recall"]
+        out = {m: _agg(m) for m in metric_names}
+        out["measured"] = {m: _measured(m) for m in metric_names}
+        out["per_question"] = per_question
+        return out
     except Exception as e:
         print(f"  ⚠️  RAGAS evaluation failed: {e}")
         return {"faithfulness": 0.0, "answer_relevancy": 0.0,
                 "context_precision": 0.0, "context_recall": 0.0, "per_question": []}
+
+
+def _metric_map(r: EvalResult) -> dict:
+    """Chỉ lấy metric đo được (bỏ None) để xếp hạng failure."""
+    raw = {
+        "faithfulness": r.faithfulness,
+        "answer_relevancy": r.answer_relevancy,
+        "context_precision": r.context_precision,
+        "context_recall": r.context_recall,
+    }
+    return {k: v for k, v in raw.items() if v is not None}
 
 
 def failure_analysis(eval_results: list[EvalResult], bottom_n: int = 10) -> list[dict]:
@@ -104,16 +122,15 @@ def failure_analysis(eval_results: list[EvalResult], bottom_n: int = 10) -> list
 
     scored = []
     for r in eval_results:
-        metric_map = {
-            "faithfulness": r.faithfulness,
-            "answer_relevancy": r.answer_relevancy,
-            "context_precision": r.context_precision,
-            "context_recall": r.context_recall,
-        }
-        avg = sum(metric_map.values()) / max(len(metric_map), 1)
+        metric_map = _metric_map(r)
+        if not metric_map:
+            continue
+        avg = sum(metric_map.values()) / len(metric_map)
         worst_metric = min(metric_map, key=metric_map.get)
-        scored.append({"question": r.question, "avg": avg,
-                       "worst_metric": worst_metric, "score": metric_map[worst_metric]})
+        scored.append({"question": r.question, "avg": round(avg, 4),
+                       "worst_metric": worst_metric, "score": metric_map[worst_metric],
+                       "answer": r.answer, "ground_truth": r.ground_truth,
+                       "contexts": list(r.contexts), "metrics": metric_map})
 
     scored.sort(key=lambda x: x["avg"])
     failures = []
@@ -121,8 +138,13 @@ def failure_analysis(eval_results: list[EvalResult], bottom_n: int = 10) -> list
         diagnosis, suggested_fix = diagnostic_tree[item["worst_metric"]]
         failures.append({
             "question": item["question"],
+            "avg_score": item["avg"],
             "worst_metric": item["worst_metric"],
             "score": round(item["score"], 4),
+            "metrics": {k: round(v, 4) for k, v in item["metrics"].items()},
+            "answer": item["answer"],
+            "ground_truth": item["ground_truth"],
+            "contexts": item["contexts"],
             "diagnosis": diagnosis,
             "suggested_fix": suggested_fix,
         })

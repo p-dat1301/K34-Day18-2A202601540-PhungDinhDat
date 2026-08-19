@@ -54,15 +54,44 @@ class CrossEncoderReranker:
 
 
 class FlashrankReranker:
-    """Lightweight alternative (<5ms). Optional."""
-    def __init__(self):
+    """Alternative nhẹ hơn CrossEncoder.
+
+    Model mặc định của flashrank ~4MB (so với 2.2GB của bge-reranker-v2-m3) nên
+    chạy CPU vẫn nhanh. Đổi lại chất lượng thấp hơn trên tiếng Việt vì model
+    mặc định train chủ yếu trên tiếng Anh — dùng khi latency quan trọng hơn
+    precision. So sánh bằng `benchmark_reranker()`.
+    """
+
+    def __init__(self, model_name: str | None = None):
+        self.model_name = model_name
         self._model = None
 
+    def _load_model(self):
+        if self._model is None:
+            from flashrank import Ranker
+            self._model = Ranker(model_name=self.model_name) if self.model_name else Ranker()
+        return self._model
+
     def rerank(self, query: str, documents: list[dict], top_k: int = RERANK_TOP_K) -> list[RerankResult]:
-        # TODO (optional): from flashrank import Ranker, RerankRequest
-        # model = Ranker(); passages = [{"text": d["text"]} for d in documents]
-        # results = model.rerank(RerankRequest(query=query, passages=passages))
-        return []
+        if not documents:
+            return []
+        from flashrank import RerankRequest
+
+        model = self._load_model()
+        # flashrank trả về passage kèm "id" -> map ngược lại document gốc để
+        # giữ nguyên metadata và original_score.
+        passages = [{"id": i, "text": doc["text"]} for i, doc in enumerate(documents)]
+        ranked = model.rerank(RerankRequest(query=query, passages=passages))
+        return [
+            RerankResult(
+                text=documents[item["id"]]["text"],
+                original_score=float(documents[item["id"]].get("score", 0.0)),
+                rerank_score=float(item["score"]),
+                metadata=documents[item["id"]].get("metadata", {}),
+                rank=i,
+            )
+            for i, item in enumerate(ranked[:top_k])
+        ]
 
 
 def benchmark_reranker(reranker, query: str, documents: list[dict], n_runs: int = 5) -> dict:

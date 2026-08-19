@@ -133,4 +133,21 @@ GPU 0 has a total capacity of 3.68 GiB of which 15.44 MiB is free.
 
 ## Phụ lục: Kết quả đo được
 
-Xem `analysis/failure_analysis.md` và `ragas_report.json`.
+Judge model: `gemini-3.1-flash-lite`, 20/20 câu chấm được ở cả hai cấu hình.
+
+| Metric | Naive Baseline | Production | Δ |
+|--------|---------------:|-----------:|---:|
+| Faithfulness | 0.8500 | 0.8900 | +0.0400 |
+| Answer Relevancy | 0.6906 | 0.7304 | +0.0398 |
+| Context Precision | 0.7500 | 0.6958 | -0.0542 |
+| Context Recall | 0.8250 | 0.8083 | -0.0167 |
+
+Latency production (ms/query): hybrid search 31.8 · rerank CPU 6019.7 · LLM 1254.4 · **tổng 7305.9** (p95 13759.1).
+
+Phân tích chi tiết + bottom-5 + Error Tree: `analysis/failure_analysis.md`. Số liệu gốc: `ragas_report.json`, `naive_baseline_report.json`.
+
+### Ghi chú về việc đổi judge model
+
+Lần chấm đầu dùng `gemini-3.5-flash-lite` thì cạn quota ngày (500 request/model) khi mới chấm được 13–15/20 câu, phần còn lại thành NaN. Vì report đã lưu sẵn `question / answer / contexts / ground_truth` cho từng câu nên viết `rejudge.py` để chấm lại từ dữ liệu đó bằng model khác — không phải chạy lại chunking, enrichment hay retrieval. Cả baseline lẫn production đều được chấm lại bằng cùng `gemini-3.1-flash-lite` để Δ có ý nghĩa.
+
+Bài học rút ra: **luôn lưu input của evaluation xuống đĩa, tách hẳn khỏi bước chấm điểm.** Nếu không, mỗi lần eval hỏng là mất luôn cả pipeline run phía trước.
